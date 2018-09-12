@@ -1,0 +1,75 @@
+schedule（）方法是资源调度的方法，在很多情况下会用到，standbyMaster是不会进行资源调度的。
+执行步骤：
+1、取出workers中的所有之前注册的worker，（状态为alive的worker）
+  首先调度driver
+//为什么要调度driver，思考：什么情况下，会注册driver，并且会导致driver被调度
+//只有用yarn-cluster模式提交的时候，才会注册driver；其他模式都会直接再本地启动
+//driver，而不会来注册driver
+
+driver的调度机制，遍历waitingDrivers（ArrayBuffer）
+只要还有活着的worker没有遍历到，就继续进行
+而且，当前这个driver还没有被启动（launched==False）
+遍历worker如果当前这个worker的空闲内存量大于等于driver所需要的内存
+并且worker的空闲cpu数量，大于等于driver需要的cpu数量
+
+启动driver：launchDriver(worker, driver)
+将driver加入worker内存的缓存结构
+同时把worker也加入到driver内部的缓存结构中
+然后向worker发送LaunchDriver消息，让worker来启动Driver
+worker接收到launchdriver的消息以后会先实例化一个driverRunner的对象
+然后调用driverRunner的start方法起一个driverRunner的线程，由driverRunner的线程来启动和管理driver进程
+其中最主要的是prepareAndRunDriver()方法，里面写的是为driver准备工作目录，以及下载用户的Jar文件到driver的工作目录并返回路径名称
+
+然后构建ProcessBuilder
+传入了driver的启动命令、需要的内存大小等信息。通过processbulder启动driver进程，经过层层调用，最终返回的是runCommandWithRetry方法的exitcode属性
+，用于上一层进行判断
+在做完driver的工作后对driver的退出状态做一些处理
+向所属的worker发出一个driverstatechanged的事件，或者是抛出一个异常
+（这一段是driver执行完成以后的操作，也一并写到这里
+//driver执行完以后，driverrunner线程会发送一个状态给worker
+//然后worker实际上会将driverstatechanged消息发送给master，master会进行状态改变处理，master的处理很简单：
+    如果driver的状态是错误、完成、杀死、失败。删除driver
+//将driver从本地缓存移除，加入完成的driver队列
+//将driver的内存和cpu释放处理（此处是worker的具体方法的注释）（worker 635 handleDriverStateChanged）
+worker会调用handleDriverStateChanged方法，来处理该消息）
+
+完成启动driver后将driver从waitingDrivers缓存队列中移除
+
+startExecutorsOnWorkers()
+在这个方法中会为每一个application启动一个executor，首先需要从workers中筛选出那些满足条件的worker用来启动executor
+* 需要满足的条件如下：
+* 1. worker中的剩余的空闲的内存需要大于application中指定的每一个executor所需要的内存
+* 2. worker中的剩余的空闲的cpu的核数必须大于application中指定的每一个executor所需要的cpu的核数
+        （如果启动的时候没有指定coresPerExecutor，那么就认为这个值是1）
+        
+调用scheduleExecutorsOnWorkers方法
+关于这个方法，首先需要注意的是启动worker的策略由两个：
+    一个是默认的方法，在尽可能多的worker上启动executor；另一个方法正好相反，在尽可能少的worker上启动executor。
+其次，还有一个很重要的是关于worker的core的分配：每一次向worker分配core的单位是executor，
+也就是说每次分配的core的数量是coresPerExecutor（当然，如果这个属性没有设置的话，会默认取1的，也就是每次分配一个core）
+清楚了这些，再获取必须的信息，然后就可以循环为worker分配executor了
+  （这里也拥有着两个策略：如果一个worker上可以拥有多个executor那么就分配executor数量，
+    如果一个worker上只能拥有一个executor那么就增加executor的core的数量。该策略是以oneExecutorPerWorker属性的取值为依据的）。
+最后该方法返回的是assignedCores属性，也就是在这个方法中按策略分配好了core的分配方案，并将方案传回
+
+循环调用allocateWorkerResourceToExecutors方法
+这个循环是为了按照刚才的分配策略为executor分配worker上的资源
+每次调用这个方法，首先先根据传入的参数（coresPerExecutor）计算worker上大致能起几个executor，每个executor分配多少core
+  （事实上这里同样是两个策略，这两种策略取决于我们是否由设置coresPerExecutor参数，如果有就按照我们的设置进行分配，
+    如果没有那么就按照刚刚分配好的策略进行参数指定）
+事实上，我们指定的参数也是有可能会被算法优化而被打破的。而如果不指定，尤其是coresPerExecutor属性
+  （该属性没有设置还会设置每个worker只有一个executor），会造成为worker分配core的时候会一个core的分配，这样有些时候是会出问题的
+
+在这个方法里将executor的信息注册到application中，然后launchexecutor
+（launchexecutor与launchdriver相差不大：
+同样将executor加入worker内存，然后分别向worker和executor发送消息
+worker同样会为executor创建一个工作空间然后实例化一个executorRunner线程，通过该线程对executor进程进行创建和管理
+executorRunner线程主要是一个fetchAndRunExecutor（）方法
+同样是与driver相似，做一些准备后调用process的waitFor（）方法，启动executor进程，在executor执行完之后拿到返回状态，
+向executorRunner所属的worker ，发送ExecutorStateChanged消息（与driver基本相同）
+向master发送ExecutorStateChanged消息，改变executor状态，调用schele方法进行重新调度
+）
+将application的状态置为RUNNING
+
+至此，schedule方法差不多全部分析完了，有些违和感，我认为应该是线程的调度机制和新加入的hook机制，会影响他们的执行顺序，
+在还没有弄清楚这些机制以前，差不多就做到这样将源码分析完了，却不能完整的完成整个流程。
