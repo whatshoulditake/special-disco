@@ -1,0 +1,15 @@
+首先从初始化sparkContext开始，在进行编写spark应用程序的时候第一步是配饰sparkconf，第二步是根据sparkconf配置sparkContext（先暂时不细纠，不然时间太紧了。）
+sparkcontext有一个createTaskScheduler方法，他会返回创建并返回SchedulerBackend, TaskScheduler
+具体是根据master参数来进行创建（local，yarn，standalone）
+大同小异的是实例化一个TaskSchedulerImpl对象，然后根据该对象再创建一个具体的，不同的SchedulerBackend对象
+然后根据以上创建的两个对象调用scheduler.initialize(backend)方法，该方法是创建一个调度池
+创建完成后返回backend和schedule对象
+调用backend对象的start（）方法
+start方法有个很重要的参数准备是appDesc--他创建了ApplicationDescription
+
+他就代表了当前执行的application的一些情况，包括application最大需要多少cpu core，每个slave上需要多少内存
+然后会通过appdesc创建appclient
+appclient是一个接口
+* 他负责为application和spark集群进行通信
+* 她会接受一个spark master的url，以及一个applicationdescription，和一个集群事件的监听器，以及各种事情发生时监听器的回调函数
+最后将application进行注册然后把state置为RUNNING
